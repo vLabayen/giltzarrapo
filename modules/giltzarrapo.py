@@ -20,7 +20,7 @@ import multiprocessing
 found_block = multiprocessing.Event()
 
 class Giltzarrapo:
-    def __init__(self, chunkSize = 512):
+    def __init__(self, chunkSize = 512, n_processes = multiprocessing.cpu_count()):
         # Check chunkSize is power of 2: https://stackoverflow.com/questions/29480680/finding-if-a-number-is-a-power-of-2-using-recursion
         if not bool(chunkSize and not (chunkSize & (chunkSize-1))): raise ValueError('chunkSize must be power of 2')
 
@@ -28,7 +28,7 @@ class Giltzarrapo:
         self.blocks = []
         self.info = {}
         self.status = None
-        self.n_processes = multiprocessing.cpu_count()*2
+        self.n_processes = n_processes
 
     @staticmethod
     def generateRSApair(passphrase = "", dir = None, name = "giltza_rsa", RSAlen = 4096):
@@ -118,7 +118,7 @@ class Giltzarrapo:
 
     def findBlock(self, passwd, PRIVkey, num_blocks):
 
-        # Compute indexes of RSA blocks from the original blocks 
+        # Compute indexes of RSA blocks from the original blocks
         num_rsa_blocks = len(self.blocks) - (num_blocks-1)
 
         # Fast mode
@@ -131,33 +131,42 @@ class Giltzarrapo:
 
         # Bruteforce mode
         else:
+            if self.n_processes > 1: #Multiprocess
+                # Input/output variables for parallel processes
+                # We don't need a queue for the output value, since there is only one valid block, unless there is a hash collision. Changing
+                # the value for 'output_val' is atomic.
+                # If there is a collision for two blocks, there is a possible race condition where the index for the second block overwrites
+                # the first one, if the second process has already checked the 'found_block' flag in the current iteration in _block_check().
+                input_queue = multiprocessing.Queue()
+                output_val = multiprocessing.Value('i')
 
-            # Input/output variables for parallel processes
-            # We don't need a queue for the output value, since there is only one valid block, unless there is a hash collision. Changing
-            # the value for 'output_val' is atomic.
-            # If there is a collision for two blocks, there is a possible race condition where the index for the second block overwrites
-            # the first one, if the second process has already checked the 'found_block' flag in the current iteration in _block_check(). 
-            input_queue = multiprocessing.Queue()
-            output_val = multiprocessing.Value('i')
+                # Reset flag
+                global found_block
+                found_block.clear()
 
-            # Reset flag
-            global found_block
-            found_block.clear()
+                # Put indexes in queue and start parallel processes
+                for i in range(num_rsa_blocks): input_queue.put(i)
+                for _ in range(self.n_processes):
+                    multiprocessing.Process(
+                        target=self._block_check,
+                        args=(input_queue, output_val, num_blocks, passwd, PRIVkey),
+                        daemon=True
+                    ).start()
+                    input_queue.put(None)
 
-            # Put indexes in queue and start parallel processes
-            for i in range(num_rsa_blocks): input_queue.put(i)
-            for _ in range(self.n_processes):
-                multiprocessing.Process(
-                    target=self._block_check,
-                    args=(input_queue, output_val, num_blocks, passwd, PRIVkey),
-                    daemon=True
-                ).start()
-                input_queue.put(None)
+                # TODO: add timeout to .wait() so an exception can be raised in case the block is not found
+                # Alternatively, initialize output_val to -1, join() processes and then check if output_val>=0
+                found_block.wait()
+                return output_val.value
+            else:
+                for i in range(num_rsa_blocks):
+                    rsa_block = b"".join([self.blocks[i+j] for j in range(num_blocks)])
 
-            # TODO: add timeout to .wait() so an exception can be raised in case the block is not found
-            # Alternatively, initialize output_val to -1, join() processes and then check if output_val>=0
-            found_block.wait()
-            return output_val.value
+                    #Decrypt the block and compare the hash with the challenge
+                    try : decryptedBlock = PRIVkey.decrypt(rsa_block)
+                    except : continue
+                    if SHA.new(SHA256.new(decryptedBlock + bytes(passwd, encoding = 'utf-8')).digest()).digest() == self.info['challenge']: return i
+                raise ValueError('The symetric block could not be found. It may be caused by a wrong password and/or privkey')
 
     def readPlain(self, infile):
         blocks = []
@@ -296,10 +305,10 @@ class Giltzarrapo:
             del self.blocks[selected_block + 1:selected_block + num_blocks]
 
             # Verify the challenge
-            try : block_hash = SHA256.new(PRIVkey.decrypt(self.blocks[selected_block]) + bytes(passwd, encoding = 'utf-8')).digest()
+            try : decryptedBlock = PRIVkey.decrypt(self.blocks[selected_block])
             except : raise ValueError('Can not decrypt with {} as selected block'.format(selected_block))
-            signature = SHA.new(block_hash).digest()
-            if signature != self.info['challenge']: raise ValueError('Wrong selected block or wrong password')
+            block_hash = SHA256.new(decryptedBlock + bytes(passwd, encoding = 'utf-8')).digest()
+            if SHA.new(block_hash).digest() != self.info['challenge']: raise ValueError('Wrong selected block or wrong password')
 
         encryptor = AES.new(block_hash)
 

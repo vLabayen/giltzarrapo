@@ -2,3 +2,6 @@ Add support for multicore for encrypt - decrypt
 Mirar xq petan algunos bloques al cifrar - descifrar con RSA
 	- Quitar la recusividad en encrypt si se arregla
 Permitir cifrado - descifrado sin necesidad de leer todo el fichero en RAM
+Rename chunkSize by blockSize
+Arreglar BrokenPipeError en el decrypt de ficheros grandes
+	Para reproducir el error, utilizar lo que hay en test
